@@ -1,0 +1,329 @@
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b1020">
+<title>Audio Detector</title>
+<style>
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 20px;
+  min-height: 100vh;
+  background: #0b1020;
+  color: #f1f5f9;
+  font-family: Arial, sans-serif;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.app {
+  width: 100%;
+  max-width: 430px;
+  background: #151c30;
+  border: 1px solid #293653;
+  border-radius: 22px;
+  padding: 24px;
+  box-shadow: 0 20px 60px #0005;
+}
+
+h1 { margin: 0 0 8px; font-size: 27px; }
+.subtitle { color: #9eacc7; line-height: 1.5; }
+
+.panel {
+  background: #0e1628;
+  border: 1px solid #2a3853;
+  border-radius: 14px;
+  padding: 16px;
+  margin: 20px 0;
+}
+
+.status { font-weight: bold; color: #fbbf24; }
+.meter {
+  height: 12px;
+  background: #303b50;
+  border-radius: 20px;
+  overflow: hidden;
+  margin: 14px 0 8px;
+}
+
+#bar {
+  width: 0%;
+  height: 100%;
+  background: #34d399;
+  transition: width .1s;
+}
+
+#percent { color: #aebbd4; font-size: 14px; }
+
+label { display: block; margin-bottom: 8px; }
+
+select, button {
+  width: 100%;
+  padding: 14px;
+  margin-top: 10px;
+  border-radius: 11px;
+  font-size: 15px;
+}
+
+select {
+  background: #0b1020;
+  color: white;
+  border: 1px solid #40516e;
+}
+
+button {
+  border: 0;
+  color: white;
+  background: #6366f1;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+button.secondary { background: #293653; }
+button:disabled { opacity: .5; }
+
+.note {
+  color: #9eacc7;
+  font-size: 12px;
+  line-height: 1.6;
+  margin-top: 18px;
+}
+
+#log {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  color: #fca5a5;
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>🎧 Audio Detector</h1>
+  <div class="subtitle">
+    Проверка аудиовхода и обнаружение звукового сигнала.
+  </div>
+
+  <div class="panel">
+    <div>Состояние</div>
+    <div class="status" id="status">Ожидание запуска</div>
+    <div class="meter"><div id="bar"></div></div>
+    <div id="percent">Уровень сигнала: 0%</div>
+  </div>
+
+  <label for="devices">Доступный аудиовход</label>
+  <select id="devices">
+    <option value="">Автоматический выбор</option>
+  </select>
+
+  <button id="start">▶ Начать проверку</button>
+  <button id="stop" class="secondary" disabled>
+    ■ Остановить
+  </button>
+  <button id="refresh" class="secondary">
+    ↻ Обновить аудиовходы
+  </button>
+
+  <div class="note" id="message">
+    Подключи устройство. Разреши браузеру доступ к микрофону.
+    Для работы обычно требуется HTTPS.
+  </div>
+  <div id="log"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+let stream = null;
+let context = null;
+let analyser = null;
+let frame = null;
+let source = null;
+let lastSignal = 0;
+
+function showError(error) {
+  $("status").textContent = "Ошибка";
+  $("status").style.color = "#fb7185";
+  $("log").textContent =
+    (error.name || "Error") + ": " +
+    (error.message || "Неизвестная ошибка");
+}
+
+async function refreshDevices() {
+  if (!navigator.mediaDevices ||
+      !navigator.mediaDevices.enumerateDevices) {
+    $("message").textContent =
+      "Этот браузер не предоставляет список аудиовходов.";
+    return;
+  }
+
+  try {
+    const all = await navigator.mediaDevices.enumerateDevices();
+    const audioInputs = all.filter(
+      device => device.kind === "audioinput"
+    );
+
+    const previous = $("devices").value;
+    $("devices").replaceChildren();
+
+    const automatic = document.createElement("option");
+    automatic.value = "";
+    automatic.textContent = "Автоматический выбор";
+    $("devices").appendChild(automatic);
+
+    audioInputs.forEach((device, index) => {
+      const option = document.createElement("option");
+      option.value = device.deviceId;
+      option.textContent =
+        device.label || "Аудиовход " + (index + 1);
+      $("devices").appendChild(option);
+    });
+
+    if (previous &&
+        [...$("devices").options].some(o => o.value === previous)) {
+      $("devices").value = previous;
+    }
+
+    $("message").textContent = audioInputs.length
+      ? "Найдено аудиовходов: " + audioInputs.length
+      : "Браузер пока не показывает аудиовходы.";
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function startDetector() {
+  $("log").textContent = "";
+
+  if (!window.isSecureContext) {
+    showError({
+      name: "InsecureContext",
+      message: "Открой страницу через HTTPS."
+    });
+    return;
+  }
+
+  if (!navigator.mediaDevices ||
+      !navigator.mediaDevices.getUserMedia) {
+    showError({
+      name: "NotSupportedError",
+      message: "Браузер не поддерживает доступ к микрофону."
+    });
+    return;
+  }
+
+  try {
+    const selected = $("devices").value;
+    const audio = selected
+      ? { deviceId: { exact: selected } }
+      : true;
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio,
+      video: false
+    });
+
+    context = new (window.AudioContext ||
+                   window.webkitAudioContext)();
+
+    await context.resume();
+
+    source = context.createMediaStreamSource(stream);
+    analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+
+    $("start").disabled = true;
+    $("stop").disabled = false;
+    $("devices").disabled = true;
+    $("status").style.color = "#60a5fa";
+    $("status").textContent = "Проверка аудиосигнала";
+
+    await refreshDevices();
+    monitor();
+  } catch (error) {
+    stopDetector();
+    showError(error);
+  }
+}
+
+function monitor() {
+  if (!analyser) return;
+
+  const data = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(data);
+
+  let sum = 0;
+  for (const sample of data) {
+    const value = (sample - 128) / 128;
+    sum += value * value;
+  }
+
+  const rms = Math.sqrt(sum / data.length);
+  const percent = Math.min(100, Math.round(rms * 200));
+
+  $("bar").style.width = percent + "%";
+  $("percent").textContent = "Уровень сигнала: " + percent + "%";
+
+  if (percent >= 5) {
+    lastSignal = Date.now();
+    $("status").textContent = "Звуковой сигнал обнаружен";
+    $("status").style.color = "#34d399";
+  } else if (Date.now() - lastSignal > 1500) {
+    $("status").textContent = "Ожидание звукового сигнала";
+    $("status").style.color = "#fbbf24";
+  }
+
+  frame = requestAnimationFrame(monitor);
+}
+
+function stopDetector() {
+  if (frame !== null) cancelAnimationFrame(frame);
+  frame = null;
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+  }
+  stream = null;
+
+  if (context) {
+    context.close().catch(() => {});
+  }
+
+  context = null;
+  analyser = null;
+  source = null;
+
+  $("start").disabled = false;
+  $("stop").disabled = true;
+  $("devices").disabled = false;
+  $("bar").style.width = "0%";
+  $("percent").textContent = "Уровень сигнала: 0%";
+}
+
+$("start").addEventListener("click", startDetector);
+
+$("stop").addEventListener("click", () => {
+  stopDetector();
+  $("status").textContent = "Проверка остановлена";
+  $("status").style.color = "#fbbf24";
+});
+
+$("refresh").addEventListener("click", refreshDevices);
+
+if (navigator.mediaDevices &&
+    navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener(
+    "devicechange", refreshDevices
+  );
+}
+
+refreshDevices();
+</script>
+</body>
+</html>
